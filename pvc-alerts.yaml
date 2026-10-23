@@ -1,0 +1,62 @@
+apiVersion: monitoring.openshift.io/v1
+kind: AlertingRule
+metadata:
+  name: vsphere-csi-volume-issues
+  namespace: openshift-monitoring
+spec:
+  groups:
+  - name: vsphere-csi-volumes
+    rules:
+
+    # CSI controller calls to vCenter failing (provisioning / attach)
+    - alert: VSphereCSIControllerOperationsFailing
+      expr: |
+        sum by (method_name, grpc_status_code) (
+          increase(csi_sidecar_operations_seconds_count{
+            driver_name="csi.vsphere.vmware.com",
+            grpc_status_code!="OK",
+            method_name=~"/csi.v1.Controller/(CreateVolume|ControllerPublishVolume)"
+          }[10m])
+        ) > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "vSphere CSI {{ $labels.method_name }} failing ({{ $labels.grpc_status_code }})"
+        description: >-
+          The vSphere CSI controller is returning errors for {{ $labels.method_name }}.
+          Check: oc logs -n openshift-cluster-csi-drivers deploy/vmware-vsphere-csi-driver-controller -c csi-driver
+
+    # Kubelet-side mount/attach failures for vSphere CSI volumes
+    - alert: VSphereCSIVolumeOperationsFailing
+      expr: |
+        sum by (node, operation_name) (
+          increase(storage_operation_duration_seconds_count{
+            status!="success",
+            volume_plugin=~".*csi.vsphere.vmware.com"
+          }[10m])
+        ) > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "vSphere CSI {{ $labels.operation_name }} failing on {{ $labels.node }}"
+
+    # Symptom: pods with PVCs stuck in ContainerCreating
+    - alert: PodStuckWithPVC
+      expr: |
+        max by (namespace, pod) (
+          kube_pod_container_status_waiting_reason{reason="ContainerCreating"} == 1
+        )
+        and on (namespace, pod)
+        max by (namespace, pod) (kube_pod_spec_volumes_persistentvolumeclaims_info)
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} stuck in ContainerCreating with a PVC"
+        description: "Check events: oc describe pod -n {{ $labels.namespace }} {{ $labels.pod }}"
+
+
+# Before relying on these, run each expr in Observe → Metrics. The CSI sidecar metric names and labels can differ slightly between OCP versions. In my experience csi_sidecar_operations_seconds_count is scraped from the vSphere CSI controller via a ServiceMonitor in openshift-cluster-csi-drivers, but check that it returns data on your cluster.
+# I'd avoid alerting on kube_persistentvolumeclaim_status_phase{phase="Pending"} alone. thin-csi uses WaitForFirstConsumer, so a Pending PVC without a pod is normal and would create noise.
